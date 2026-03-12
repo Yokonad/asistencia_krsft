@@ -1,0 +1,13 @@
+{
+  "name": "AsistenciaKrsft",
+  "slug": "asistencia_krsft",
+  "display_name": "ASISTENCIA",
+  "version": "1.0.0",
+  "description": "v1.0.0: Gestión de asistencia del personal",
+  "icon": "icon.svg",
+  "color": "#10B981",
+  "gradient": "#10B981",
+  "author": "yokonad",
+  "enabled": true,
+  "dependencies": []
+}

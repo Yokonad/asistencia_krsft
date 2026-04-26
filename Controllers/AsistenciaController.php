@@ -9,7 +9,13 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use App\Services\LogKrsftService;
 use Inertia\Inertia;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
+use PhpOffice\PhpSpreadsheet\Style\Border;
+use PhpOffice\PhpSpreadsheet\Style\Fill;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 class AsistenciaController extends Controller
 {
@@ -104,6 +110,56 @@ class AsistenciaController extends Controller
         $photoPath = $photo->storeAs('uploads', $filename, 'public');
         $capturedAt = now();
 
+        $latestTodayRecord = $this->attendanceDB()
+            ->where('trabajador_id', $worker->id)
+            ->whereDate('captured_at', $capturedAt->toDateString())
+            ->orderByDesc('captured_at')
+            ->first();
+
+        if ($latestTodayRecord && !empty($latestTodayRecord->check_out_at)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Ya registraste entrada y salida el día de hoy',
+            ], 409);
+        }
+
+        if ($latestTodayRecord && empty($latestTodayRecord->check_out_at)) {
+            $checkOutAt = now();
+            $entryAt = Carbon::parse($latestTodayRecord->captured_at);
+            $workedMinutes = max($entryAt->diffInMinutes($checkOutAt, false), 0);
+
+            $this->attendanceDB()->where('id', $latestTodayRecord->id)->update([
+                'check_out_at' => $checkOutAt,
+                'check_out_latitude' => $validated['latitude'],
+                'check_out_longitude' => $validated['longitude'],
+                'check_out_accuracy_meters' => $validated['accuracy'] ?? null,
+                'check_out_photo_path' => $photoPath,
+                'worked_minutes' => $workedMinutes,
+            ]);
+
+            LogKrsftService::log(
+                module: 'asistenciakrsft',
+                action: 'salida_registrada',
+                message: "Salida registrada para empleado ID {$worker->id}",
+                level: 'info',
+                userId: auth()->id(),
+                userName: auth()->user()->name,
+                extra: ['employee_id' => $worker->id, 'fecha' => now(), 'worked_minutes' => $workedMinutes]
+            );
+
+            return response()->json([
+                'success' => true,
+                'action' => 'check-out',
+                'message' => 'Salida registrada correctamente',
+                'summary' => [
+                    'worked_minutes' => $workedMinutes,
+                    'worked_time' => $this->formatWorkedTime($workedMinutes),
+                    'check_out_at' => $checkOutAt,
+                ],
+                'data' => $this->attendanceDB()->find($latestTodayRecord->id),
+            ]);
+        }
+
         $recordId = $this->attendanceDB()->insertGetId([
             'trabajador_id' => $worker->id,
             'dni' => $worker->dni,
@@ -115,11 +171,28 @@ class AsistenciaController extends Controller
             'device_type' => $this->resolveDeviceType($request->userAgent()),
             'captured_at' => $capturedAt,
             'created_at' => $capturedAt,
+            'check_out_at' => null,
+            'check_out_latitude' => null,
+            'check_out_longitude' => null,
+            'check_out_accuracy_meters' => null,
+            'check_out_photo_path' => null,
+            'worked_minutes' => null,
         ]);
+
+        LogKrsftService::log(
+            module: 'asistenciakrsft',
+            action: 'entrada_registrada',
+            message: "Entrada registrada para empleado ID {$worker->id}",
+            level: 'info',
+            userId: auth()->id(),
+            userName: auth()->user()->name,
+            extra: ['employee_id' => $worker->id, 'fecha' => now()]
+        );
 
         return response()->json([
             'success' => true,
-            'message' => 'Asistencia registrada correctamente',
+            'action' => 'check-in',
+            'message' => 'Entrada registrada correctamente',
             'data' => $this->attendanceDB()->find($recordId),
         ], 201);
     }
@@ -143,12 +216,17 @@ class AsistenciaController extends Controller
                 'ar.longitude',
                 'ar.accuracy_meters',
                 'ar.photo_path',
+                'ar.check_out_photo_path',
                 'ar.device_type',
                 'ar.captured_at',
+                'ar.check_out_at',
+                'ar.worked_minutes',
                 'ar.created_at',
                 // Derive fecha and hora from captured_at
                 DB::raw("DATE(ar.captured_at) as fecha"),
                 DB::raw("TIME_FORMAT(ar.captured_at, '%H:%i') as hora_entrada"),
+                DB::raw("TIME_FORMAT(ar.check_out_at, '%H:%i') as hora_salida"),
+                DB::raw("COALESCE(ar.worked_minutes, CASE WHEN ar.check_out_at IS NOT NULL THEN TIMESTAMPDIFF(MINUTE, ar.captured_at, ar.check_out_at) ELSE NULL END) as worked_minutes_calc"),
             ]);
 
         // Filter by date range
@@ -182,12 +260,295 @@ class AsistenciaController extends Controller
 
         $query->orderBy('ar.captured_at', 'desc');
 
-        $records = $query->get();
+        $records = $query->get()->map(function ($row) {
+            $minutes = $row->worked_minutes_calc ?? $row->worked_minutes;
+            $minutes = is_numeric($minutes) ? (int) $minutes : null;
+
+            $capturedAtLima = !empty($row->captured_at)
+                ? Carbon::parse($row->captured_at)->timezone('America/Lima')
+                : null;
+
+            $checkOutAtLima = !empty($row->check_out_at)
+                ? Carbon::parse($row->check_out_at)->timezone('America/Lima')
+                : null;
+
+            $row->fecha = $capturedAtLima?->toDateString() ?? $row->fecha;
+            $row->hora_entrada = $capturedAtLima?->format('H:i') ?? $row->hora_entrada;
+            $row->hora_salida = $checkOutAtLima?->format('H:i') ?? $row->hora_salida;
+            $row->worked_minutes = $minutes;
+            $row->worked_time = $this->formatWorkedTime($minutes);
+
+            // Schedule type resolution for expected_salida indicator
+            $row->expected_salida = null;
+            $row->salida_missing = empty($row->check_out_at);
+            $row->is_salida_auto_calculated = false;
+
+            if ($row->salida_missing && $row->trabajador_id && $row->fecha) {
+                $assignment = DB::connection('attendance')
+                    ->table('worker_schedule_types as wst')
+                    ->join('schedule_types as st', 'st.id', '=', 'wst.schedule_type_id')
+                    ->where('wst.worker_id', $row->trabajador_id)
+                    ->where('wst.effective_from', '<=', $row->fecha)
+                    ->where('st.is_active', true)
+                    ->orderByDesc('wst.effective_from')
+                    ->select('st.expected_end_time', 'st.auto_fill_salida')
+                    ->first();
+
+                if ($assignment) {
+                    $row->expected_salida = $assignment->expected_end_time;
+                    $row->is_salida_auto_calculated = !empty($assignment->auto_fill_salida);
+                }
+            }
+
+            return $row;
+        });
 
         return response()->json([
             'success' => true,
             'data' => $records,
             'total' => $records->count(),
+        ]);
+    }
+
+    public function exportXlsx(Request $request)
+    {
+        $periodoInput = (string) $request->input('periodo', 'dia');
+        $periodo = Str::lower(Str::ascii(trim($periodoInput)));
+        $fechaBase = $request->input('fecha') ?: now('America/Lima')->toDateString();
+
+        $fechaDesde = $request->input('fecha_desde');
+        $fechaHasta = $request->input('fecha_hasta');
+
+        if (empty($fechaDesde) || empty($fechaHasta)) {
+            $base = Carbon::parse($fechaBase)->timezone('America/Lima');
+
+            if (in_array($periodo, ['semana', 'weekly', 'week'], true)) {
+                $fechaDesde = $base->copy()->startOfWeek(Carbon::MONDAY)->toDateString();
+                $fechaHasta = $base->copy()->endOfWeek(Carbon::SUNDAY)->toDateString();
+                $periodo = 'semana';
+            } elseif (in_array($periodo, ['mes', 'monthly', 'month'], true)) {
+                $fechaDesde = $base->copy()->startOfMonth()->toDateString();
+                $fechaHasta = $base->copy()->endOfMonth()->toDateString();
+                $periodo = 'mes';
+            } else {
+                $fechaDesde = $base->toDateString();
+                $fechaHasta = $base->toDateString();
+                $periodo = 'dia';
+            }
+        }
+
+        $query = $this->attendanceDB('attendance_records as ar')
+            ->leftJoin('trabajadores as t', 't.id', '=', 'ar.trabajador_id')
+            ->select([
+                DB::raw("COALESCE(ar.worked_minutes, CASE WHEN ar.check_out_at IS NOT NULL THEN TIMESTAMPDIFF(MINUTE, ar.captured_at, ar.check_out_at) ELSE NULL END) as worked_minutes"),
+                'ar.trabajador_id',
+                'ar.dni',
+                'ar.worker_name as trabajador_nombre',
+                't.cargo',
+                'ar.photo_path',
+                'ar.captured_at',
+                'ar.check_out_at',
+            ]);
+
+        $query->whereDate('ar.captured_at', '>=', $fechaDesde);
+        $query->whereDate('ar.captured_at', '<=', $fechaHasta);
+
+        if ($request->filled('search')) {
+            $search = '%' . $request->search . '%';
+            $query->where(function ($q) use ($search) {
+                $q->where('ar.worker_name', 'like', $search)
+                    ->orWhere('ar.dni', 'like', $search)
+                    ->orWhere('t.cargo', 'like', $search);
+            });
+        }
+
+        if ($request->filled('origin')) {
+            if ($request->origin === 'Registro manual') {
+                $query->where('ar.photo_path', 'manual-entry');
+            } elseif ($request->origin === 'Captura app') {
+                $query->where(function ($q) {
+                    $q->whereNull('ar.photo_path')
+                        ->orWhere('ar.photo_path', '!=', 'manual-entry');
+                });
+            }
+        }
+
+        $records = $query
+            ->orderBy('ar.captured_at', 'desc')
+            ->get()
+            ->map(function ($record) {
+                $capturedAtLima = !empty($record->captured_at)
+                    ? Carbon::parse($record->captured_at)->timezone('America/Lima')
+                    : null;
+
+                $checkOutAtLima = !empty($record->check_out_at)
+                    ? Carbon::parse($record->check_out_at)->timezone('America/Lima')
+                    : null;
+
+                $record->captured_at_lima = $capturedAtLima;
+                $record->check_out_at_lima = $checkOutAtLima;
+                $record->fecha_lima = $capturedAtLima?->toDateString();
+                $record->hora_entrada_lima = $capturedAtLima?->format('H:i');
+                $record->hora_salida_lima = $checkOutAtLima?->format('H:i');
+                $record->worked_minutes = is_numeric($record->worked_minutes) ? (int) $record->worked_minutes : 0;
+
+                return $record;
+            });
+
+        $resumenTrabajadores = $records
+            ->groupBy(function ($row) {
+                $keyId = $row->trabajador_id ?? ('dni_' . ($row->dni ?? 'sin_dni'));
+                return $keyId . '|' . ($row->dni ?? '') . '|' . ($row->trabajador_nombre ?? 'SIN NOMBRE');
+            })
+            ->map(function ($rows) {
+                $first = $rows->first();
+
+                $totalMinutes = $rows->sum(function ($r) {
+                    return is_numeric($r->worked_minutes) ? (int) $r->worked_minutes : 0;
+                });
+
+                $diasConRegistro = $rows
+                    ->pluck('fecha_lima')
+                    ->filter()
+                    ->unique()
+                    ->count();
+
+                $primeraEntrada = $rows
+                    ->pluck('captured_at_lima')
+                    ->filter()
+                    ->sortBy(fn ($date) => $date->getTimestamp())
+                    ->first();
+
+                $ultimaSalida = $rows
+                    ->pluck('check_out_at_lima')
+                    ->filter()
+                    ->sortByDesc(fn ($date) => $date->getTimestamp())
+                    ->first();
+
+                $origenes = $rows
+                    ->map(fn ($r) => ($r->photo_path ?? null) === 'manual-entry' ? 'Registro manual' : 'Captura app')
+                    ->unique()
+                    ->values();
+
+                return [
+                    'dni' => $first->dni ?? '',
+                    'trabajador_nombre' => $first->trabajador_nombre ?? 'SIN NOMBRE',
+                    'cargo' => $first->cargo ?? 'Sin cargo',
+                    'dias_con_registro' => $diasConRegistro,
+                    'primera_entrada' => $primeraEntrada ? $primeraEntrada->format('d/m/Y H:i') : '—',
+                    'ultima_salida' => $ultimaSalida ? $ultimaSalida->format('d/m/Y H:i') : '—',
+                    'horas_totales' => $this->formatWorkedTime($totalMinutes) ?? '00:00',
+                    'total_registros' => $rows->count(),
+                    'origen' => $origenes->count() > 1 ? 'Mixto' : ($origenes->first() ?? 'Captura app'),
+                ];
+            })
+            ->sortBy('trabajador_nombre', SORT_NATURAL | SORT_FLAG_CASE)
+            ->values();
+
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('Asistencias');
+
+        $periodoLabel = $periodo === 'semana' ? 'Semanal' : ($periodo === 'mes' ? 'Mensual' : 'Diario');
+        $generadoEn = now('America/Lima')->format('d/m/Y H:i');
+
+        $sheet->mergeCells('A1:I1');
+        $sheet->setCellValue('A1', 'REPORTE DE ASISTENCIAS');
+
+        $sheet->mergeCells('A2:I2');
+        $sheet->setCellValue('A2', "Tipo: {$periodoLabel} | Período: {$fechaDesde} a {$fechaHasta} | Generado (PE): {$generadoEn}");
+
+        $headers = ['DNI', 'Trabajador', 'Cargo', 'Días con registro', 'Primera entrada (PE)', 'Última salida (PE)', 'Horas totales', 'Registros', 'Origen'];
+        $headerRow = 4;
+        foreach ($headers as $index => $header) {
+            $column = chr(65 + $index);
+            $sheet->setCellValue($column . $headerRow, $header);
+        }
+
+        $row = 5;
+        foreach ($resumenTrabajadores as $record) {
+            $sheet->setCellValue('A' . $row, (string) ($record['dni'] ?? ''));
+            $sheet->setCellValue('B' . $row, (string) ($record['trabajador_nombre'] ?? ''));
+            $sheet->setCellValue('C' . $row, (string) ($record['cargo'] ?? 'Sin cargo'));
+            $sheet->setCellValue('D' . $row, (int) ($record['dias_con_registro'] ?? 0));
+            $sheet->setCellValue('E' . $row, (string) ($record['primera_entrada'] ?? '—'));
+            $sheet->setCellValue('F' . $row, (string) ($record['ultima_salida'] ?? '—'));
+            $sheet->setCellValue('G' . $row, (string) ($record['horas_totales'] ?? '00:00'));
+            $sheet->setCellValue('H' . $row, (int) ($record['total_registros'] ?? 0));
+            $sheet->setCellValue('I' . $row, (string) ($record['origen'] ?? 'Captura app'));
+            $row++;
+        }
+
+        $lastDataRow = max($row - 1, $headerRow);
+
+        $sheet->getStyle('A1:I1')->applyFromArray([
+            'font' => ['bold' => true, 'size' => 16, 'color' => ['rgb' => 'FFFFFF']],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '0AA4A4']],
+        ]);
+        $sheet->getRowDimension(1)->setRowHeight(28);
+
+        $sheet->getStyle('A2:I2')->applyFromArray([
+            'font' => ['bold' => false, 'size' => 10, 'color' => ['rgb' => '334155']],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'ECFEFF']],
+        ]);
+        $sheet->getRowDimension(2)->setRowHeight(20);
+
+        $sheet->getStyle('A4:I4')->applyFromArray([
+            'font' => ['bold' => true, 'size' => 11, 'color' => ['rgb' => 'FFFFFF']],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '0F172A']],
+            'borders' => [
+                'allBorders' => [
+                    'borderStyle' => Border::BORDER_THIN,
+                    'color' => ['rgb' => 'E2E8F0'],
+                ],
+            ],
+        ]);
+        $sheet->getRowDimension(4)->setRowHeight(22);
+
+        if ($lastDataRow >= 5) {
+            $sheet->getStyle("A5:I{$lastDataRow}")->applyFromArray([
+                'alignment' => [
+                    'horizontal' => Alignment::HORIZONTAL_CENTER,
+                    'vertical' => Alignment::VERTICAL_CENTER,
+                ],
+                'borders' => [
+                    'allBorders' => [
+                        'borderStyle' => Border::BORDER_THIN,
+                        'color' => ['rgb' => 'E2E8F0'],
+                    ],
+                ],
+            ]);
+
+            for ($line = 5; $line <= $lastDataRow; $line++) {
+                if ($line % 2 === 0) {
+                    $sheet->getStyle("A{$line}:I{$line}")->applyFromArray([
+                        'fill' => [
+                            'fillType' => Fill::FILL_SOLID,
+                            'startColor' => ['rgb' => 'F8FAFC'],
+                        ],
+                    ]);
+                }
+            }
+        }
+
+        foreach (range('A', 'I') as $column) {
+            $sheet->getColumnDimension($column)->setAutoSize(true);
+        }
+
+        $sheet->getStyle('A:I')->getAlignment()->setWrapText(false);
+        $sheet->freezePane('A5');
+        $sheet->setAutoFilter("A4:I{$lastDataRow}");
+
+        $writer = new Xlsx($spreadsheet);
+        $filename = 'asistencias_' . now()->format('Ymd_His') . '.xlsx';
+
+        return response()->streamDownload(function () use ($writer) {
+            $writer->save('php://output');
+        }, $filename, [
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         ]);
     }
 
@@ -207,19 +568,67 @@ class AsistenciaController extends Controller
                 'ar.dni',
                 'ar.worker_name as trabajador_nombre',
                 't.cargo',
+                't.estado as trabajador_estado',
                 'ar.latitude',
                 'ar.longitude',
                 'ar.accuracy_meters',
                 'ar.photo_path',
+                'ar.check_out_photo_path',
                 'ar.device_type',
                 'ar.captured_at',
+                'ar.check_out_at',
+                'ar.worked_minutes',
                 DB::raw("DATE(ar.captured_at) as fecha"),
                 DB::raw("TIME_FORMAT(ar.captured_at, '%H:%i') as hora_entrada"),
+                DB::raw("TIME_FORMAT(ar.check_out_at, '%H:%i') as hora_salida"),
+                DB::raw("COALESCE(ar.worked_minutes, CASE WHEN ar.check_out_at IS NOT NULL THEN TIMESTAMPDIFF(MINUTE, ar.captured_at, ar.check_out_at) ELSE NULL END) as worked_minutes_calc"),
             ])
             ->orderBy('ar.captured_at', 'desc')
             ->get()
             ->unique('trabajador_id')
-            ->values();
+            ->values()
+            ->map(function ($row) {
+                $minutes = $row->worked_minutes_calc ?? $row->worked_minutes;
+                $minutes = is_numeric($minutes) ? (int) $minutes : null;
+
+                $capturedAtLima = !empty($row->captured_at)
+                    ? Carbon::parse($row->captured_at)->timezone('America/Lima')
+                    : null;
+
+                $checkOutAtLima = !empty($row->check_out_at)
+                    ? Carbon::parse($row->check_out_at)->timezone('America/Lima')
+                    : null;
+
+                $row->fecha = $capturedAtLima?->toDateString() ?? $row->fecha;
+                $row->hora_entrada = $capturedAtLima?->format('H:i') ?? $row->hora_entrada;
+                $row->hora_salida = $checkOutAtLima?->format('H:i') ?? $row->hora_salida;
+                $row->worked_minutes = $minutes;
+                $row->worked_time = $this->formatWorkedTime($minutes);
+
+                // Schedule type resolution for expected_salida indicator
+                $row->expected_salida = null;
+                $row->salida_missing = empty($row->check_out_at);
+                $row->is_salida_auto_calculated = false;
+
+                if ($row->salida_missing && $row->trabajador_id && $row->fecha) {
+                    $assignment = DB::connection('attendance')
+                        ->table('worker_schedule_types as wst')
+                        ->join('schedule_types as st', 'st.id', '=', 'wst.schedule_type_id')
+                        ->where('wst.worker_id', $row->trabajador_id)
+                        ->where('wst.effective_from', '<=', $row->fecha)
+                        ->where('st.is_active', true)
+                        ->orderByDesc('wst.effective_from')
+                        ->select('st.expected_end_time', 'st.auto_fill_salida')
+                        ->first();
+
+                    if ($assignment) {
+                        $row->expected_salida = $assignment->expected_end_time;
+                        $row->is_salida_auto_calculated = !empty($assignment->auto_fill_salida);
+                    }
+                }
+
+                return $row;
+            });
 
         $totalTrabajadores = DB::table('trabajadores')
             ->where('estado', 'Activo')
@@ -233,6 +642,74 @@ class AsistenciaController extends Controller
             'total_trabajadores' => $totalTrabajadores,
             'total_presentes' => $totalPresentes,
             'total_ausentes' => max($totalTrabajadores - $totalPresentes, 0),
+            'total_jornadas_completas' => $todayRecords->whereNotNull('hora_salida')->count(),
+            'total_en_jornada' => $todayRecords->whereNull('hora_salida')->count(),
+        ]);
+    }
+
+    /**
+     * Devuelve resumen por día para el calendario de asistencias.
+     */
+    public function resumenDia(Request $request)
+    {
+        $validated = $request->validate([
+            'fecha' => ['required', 'date'],
+        ]);
+
+        $fecha = Carbon::parse($validated['fecha'])->toDateString();
+
+        $records = $this->attendanceDB('attendance_records as ar')
+            ->leftJoin('trabajadores as t', 't.id', '=', 'ar.trabajador_id')
+            ->whereDate('ar.captured_at', $fecha)
+            ->select([
+                'ar.id',
+                'ar.trabajador_id',
+                'ar.dni',
+                'ar.worker_name as trabajador_nombre',
+                't.cargo',
+                'ar.captured_at',
+                'ar.check_out_at',
+                'ar.worked_minutes',
+                DB::raw("TIME_FORMAT(ar.captured_at, '%H:%i') as hora_entrada"),
+                DB::raw("TIME_FORMAT(ar.check_out_at, '%H:%i') as hora_salida"),
+                DB::raw("COALESCE(ar.worked_minutes, CASE WHEN ar.check_out_at IS NOT NULL THEN TIMESTAMPDIFF(MINUTE, ar.captured_at, ar.check_out_at) ELSE NULL END) as worked_minutes_calc"),
+            ])
+            ->orderBy('ar.captured_at', 'desc')
+            ->get()
+            ->unique('trabajador_id')
+            ->values()
+            ->map(function ($row) {
+                $minutes = $row->worked_minutes_calc ?? $row->worked_minutes;
+                $minutes = is_numeric($minutes) ? (int) $minutes : null;
+
+                $capturedAtLima = !empty($row->captured_at)
+                    ? Carbon::parse($row->captured_at)->timezone('America/Lima')
+                    : null;
+
+                $checkOutAtLima = !empty($row->check_out_at)
+                    ? Carbon::parse($row->check_out_at)->timezone('America/Lima')
+                    : null;
+
+                $row->hora_entrada = $capturedAtLima?->format('H:i') ?? $row->hora_entrada;
+                $row->hora_salida = $checkOutAtLima?->format('H:i') ?? $row->hora_salida;
+                $row->worked_minutes = $minutes;
+                $row->worked_time = $this->formatWorkedTime($minutes);
+                return $row;
+            });
+
+        $totalTrabajadores = DB::table('trabajadores')
+            ->where('estado', 'Activo')
+            ->count();
+
+        $totalPresentes = $records->count();
+
+        return response()->json([
+            'success' => true,
+            'fecha' => $fecha,
+            'total_trabajadores' => $totalTrabajadores,
+            'total_presentes' => $totalPresentes,
+            'total_ausentes' => max($totalTrabajadores - $totalPresentes, 0),
+            'trabajadores' => $records,
         ]);
     }
 
@@ -256,12 +733,56 @@ class AsistenciaController extends Controller
         return response()->json(['success' => true, 'data' => $record]);
     }
 
+    /**
+     * Entrega la foto asociada a un registro de attendance_records.
+     */
+    public function photo($id)
+    {
+        $record = $this->attendanceDB()
+            ->select(['id', 'photo_path'])
+            ->where('id', $id)
+            ->first();
+
+        if (! $record || empty($record->photo_path) || $record->photo_path === 'manual-entry') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Registro sin foto disponible',
+            ], 404);
+        }
+
+        $relativePath = ltrim((string) $record->photo_path, '/');
+        $fileName = basename($relativePath);
+
+        $candidates = [
+            storage_path('app/public/' . $relativePath),
+            public_path($relativePath),
+            base_path('../asistencia-app/' . $relativePath),
+            '/var/www/asistencia-app/' . $relativePath,
+            '/var/www/asistencia-app/uploads/' . $fileName,
+        ];
+
+        foreach ($candidates as $path) {
+            if (is_file($path)) {
+                return response()->file($path, [
+                    'Cache-Control' => 'public, max-age=300',
+                ]);
+            }
+        }
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Archivo de foto no encontrado',
+            'photo_path' => $relativePath,
+        ], 404);
+    }
+
     public function store(Request $request)
     {
         $validated = $request->validate([
             'dni' => ['required', 'regex:/^\d{8}$/'],
             'fecha' => ['nullable', 'date'],
             'hora_entrada' => ['nullable', 'date_format:H:i'],
+            'hora_salida' => ['nullable', 'date_format:H:i'],
             'latitude' => 'nullable|numeric',
             'longitude' => 'nullable|numeric',
             'accuracy_meters' => 'nullable|numeric',
@@ -285,6 +806,16 @@ class AsistenciaController extends Controller
         }
 
         $capturedAt = $this->resolveCapturedAt($validated);
+        $checkOutAt = $this->resolveCheckOutAt($validated, null, $capturedAt);
+
+        if ($checkOutAt && $checkOutAt->lt($capturedAt)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'La hora de salida no puede ser menor a la hora de entrada',
+            ], 422);
+        }
+
+        $workedMinutes = $checkOutAt ? max($capturedAt->diffInMinutes($checkOutAt, false), 0) : null;
 
         $id = $this->attendanceDB()->insertGetId([
             'trabajador_id' => $trabajador->id,
@@ -296,6 +827,12 @@ class AsistenciaController extends Controller
             'photo_path' => 'manual-entry',
             'device_type' => 'desktop',
             'captured_at' => $capturedAt,
+            'check_out_at' => $checkOutAt,
+            'check_out_latitude' => null,
+            'check_out_longitude' => null,
+            'check_out_accuracy_meters' => null,
+            'check_out_photo_path' => null,
+            'worked_minutes' => $workedMinutes,
             'created_at' => now(),
         ]);
 
@@ -317,6 +854,7 @@ class AsistenciaController extends Controller
             'dni' => ['nullable', 'regex:/^\d{8}$/'],
             'fecha' => ['nullable', 'date'],
             'hora_entrada' => ['nullable', 'date_format:H:i'],
+            'hora_salida' => ['nullable', 'date_format:H:i'],
             'captured_at' => ['nullable', 'date'],
         ]);
 
@@ -352,8 +890,57 @@ class AsistenciaController extends Controller
             $data['captured_at'] = $this->resolveCapturedAt($validated, Carbon::parse($record->captured_at));
         }
 
+        if (
+            array_key_exists('hora_salida', $validated)
+            || !empty($validated['fecha'])
+        ) {
+            $resolvedEntry = !empty($data['captured_at'])
+                ? Carbon::parse($data['captured_at'])
+                : Carbon::parse($record->captured_at);
+
+            $resolvedCheckOut = $this->resolveCheckOutAt(
+                $validated,
+                !empty($record->check_out_at) ? Carbon::parse($record->check_out_at) : null,
+                $resolvedEntry
+            );
+
+            if ($resolvedCheckOut && $resolvedCheckOut->lt($resolvedEntry)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'La hora de salida no puede ser menor a la hora de entrada',
+                ], 422);
+            }
+
+            $data['check_out_at'] = $resolvedCheckOut;
+            $data['worked_minutes'] = $resolvedCheckOut
+                ? max($resolvedEntry->diffInMinutes($resolvedCheckOut, false), 0)
+                : null;
+        }
+
         if (!empty($data)) {
+            $oldRecord = $this->attendanceDB()->find($id);
+            $oldEntry = $oldRecord->captured_at;
+            $oldExit = $oldRecord->check_out_at;
+
             $this->attendanceDB()->where('id', $id)->update($data);
+
+            $newRecord = $this->attendanceDB()->find($id);
+            $newEntry = $newRecord->captured_at;
+            $newExit = $newRecord->check_out_at;
+
+            LogKrsftService::log(
+                module: 'asistenciakrsft',
+                action: 'asistencia_editada',
+                message: "Asistencia editada para empleado ID {$newRecord->trabajador_id}",
+                level: 'info',
+                userId: auth()->id(),
+                userName: auth()->user()->name,
+                extra: [
+                    'employee_id' => $newRecord->trabajador_id,
+                    'before' => ['hora_entrada' => $oldEntry, 'hora_salida' => $oldExit],
+                    'after' => ['hora_entrada' => $newEntry, 'hora_salida' => $newExit]
+                ]
+            );
         }
 
         return response()->json([
@@ -384,24 +971,229 @@ class AsistenciaController extends Controller
     /**
      * Counts rápidos para badges de tabs
      */
+    /**
+     * Returns monthly attendance summary for a specific worker with expected minutes.
+     * Used for calendar color indicators.
+     */
+    public function workerAttendanceSummary(Request $request)
+    {
+        $validated = $request->validate([
+            'worker_id' => ['required', 'integer'],
+            'month' => ['required', 'regex:/^\d{4}-\d{2}$/'],
+        ]);
+
+        $workerId = (int) $validated['worker_id'];
+        $month = $validated['month']; // YYYY-MM format
+
+        // Parse month boundaries
+        $year = (int) substr($month, 0, 4);
+        $monthNum = (int) substr($month, 5, 2);
+        $startDate = sprintf('%04d-%02d-01', $year, $monthNum);
+        $endDate = date('Y-m-t', strtotime($startDate));
+
+        // Fetch all attendance records for this worker in the month
+        $records = $this->attendanceDB('attendance_records as ar')
+            ->where('ar.trabajador_id', $workerId)
+            ->whereDate('ar.captured_at', '>=', $startDate)
+            ->whereDate('ar.captured_at', '<=', $endDate)
+            ->select([
+                DB::raw("DATE(ar.captured_at) as date"),
+                DB::raw("SUM(COALESCE(ar.worked_minutes, CASE WHEN ar.check_out_at IS NOT NULL THEN TIMESTAMPDIFF(MINUTE, ar.captured_at, ar.check_out_at) ELSE 0 END)) as worked_minutes"),
+            ])
+            ->groupBy(DB::raw("DATE(ar.captured_at)"))
+            ->get()
+            ->keyBy('date');
+
+        // Build a map of date => worked_minutes
+        $workedByDate = $records->mapWithKeys(fn($r) => [$r->date => (int) $r->worked_minutes])->toArray();
+
+        // For each day in the month, determine expected minutes from schedule type
+        $result = [];
+        $current = strtotime($startDate);
+        $end = strtotime($endDate);
+
+        while ($current <= $end) {
+            $date = date('Y-m-d', $current);
+            $dayOfWeek = (int) date('N', $current); // 1=Mon, 7=Sun
+
+            $hasRecord = isset($workedByDate[$date]);
+            $workedMinutes = $workedByDate[$date] ?? 0;
+
+            // Resolve schedule type for this worker on this date
+            $expectedMinutes = null;
+            $scheduleTypeName = null;
+
+            $assignment = DB::connection('attendance')
+                ->table('worker_schedule_types as wst')
+                ->join('schedule_types as st', 'st.id', '=', 'wst.schedule_type_id')
+                ->where('wst.worker_id', $workerId)
+                ->where('wst.effective_from', '<=', $date)
+                ->where('st.is_active', true)
+                ->orderByDesc('wst.effective_from')
+                ->select('st.name', 'st.expected_start_time', 'st.expected_end_time')
+                ->first();
+
+            if ($assignment && $assignment->expected_start_time && $assignment->expected_end_time) {
+                $scheduleTypeName = $assignment->name;
+                $startParts = explode(':', $assignment->expected_start_time);
+                $endParts = explode(':', $assignment->expected_end_time);
+                $startMinutes = ((int) $startParts[0]) * 60 + ((int) $startParts[1]);
+                $endMinutes = ((int) $endParts[0]) * 60 + ((int) $endParts[1]);
+                $expectedMinutes = max(0, $endMinutes - $startMinutes);
+            }
+
+            $result[] = [
+                'date' => $date,
+                'worked_minutes' => $workedMinutes,
+                'has_record' => $hasRecord,
+                'schedule_type_name' => $scheduleTypeName,
+                'expected_minutes' => $hasRecord ? ($expectedMinutes ?? 480) : null, // 8h default if worked but no schedule
+            ];
+
+            $current = strtotime('+1 day', $current);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $result,
+            'worker_id' => $workerId,
+            'month' => $month,
+        ]);
+    }
+
+    /**
+     * Returns a monthly summary for ALL workers.
+     */
+    public function generalMonthlySummary(Request $request)
+    {
+        $validated = $request->validate([
+            'month' => ['required', 'integer', 'between:1,12'],
+            'year' => ['required', 'integer', 'min:2000'],
+        ]);
+
+        $month = str_pad($validated['month'], 2, '0', STR_PAD_LEFT);
+        $year = $validated['year'];
+
+        $startDate = Carbon::createFromDate($year, $month, 1)->startOfMonth()->toDateString();
+        $endDate = Carbon::createFromDate($year, $month, 1)->endOfMonth()->toDateString();
+
+        // 1. Get all active workers
+        $workers = DB::table('trabajadores')
+            ->where('estado', 'Activo')
+            ->select('id', 'dni', 'nombre_completo', 'cargo')
+            ->get();
+
+        // 2. Get all attendance records in the month
+        $records = $this->attendanceDB('attendance_records as ar')
+            ->select([
+                'ar.trabajador_id',
+                DB::raw("DATE(ar.captured_at) as date"),
+                DB::raw("SUM(COALESCE(ar.worked_minutes, CASE WHEN ar.check_out_at IS NOT NULL THEN TIMESTAMPDIFF(MINUTE, ar.captured_at, ar.check_out_at) ELSE 0 END)) as worked_minutes"),
+            ])
+            ->whereBetween(DB::raw("DATE(ar.captured_at)"), [$startDate, $endDate])
+            ->groupBy('ar.trabajador_id', DB::raw("DATE(ar.captured_at)"))
+            ->get();
+
+        // Group records by worker_id
+        $recordsByWorker = $records->groupBy('trabajador_id');
+
+        $result = [];
+
+        foreach ($workers as $worker) {
+            $workerRecords = $recordsByWorker->get($worker->id, collect());
+            
+            $diasAsistidos = $workerRecords->count();
+            $totalWorkedMinutes = $workerRecords->sum('worked_minutes');
+
+            $result[] = [
+                'worker_id' => $worker->id,
+                'dni' => $worker->dni,
+                'nombre_completo' => $worker->nombre_completo,
+                'cargo' => $worker->cargo,
+                'dias_asistidos' => $diasAsistidos,
+                'total_worked_minutes' => (int) $totalWorkedMinutes,
+            ];
+        }
+
+        // Sort by name
+        usort($result, function($a, $b) {
+            return strcasecmp($a['nombre_completo'], $b['nombre_completo']);
+        });
+
+        return response()->json([
+            'success' => true,
+            'data' => $result,
+            'month' => $month,
+            'year' => $year,
+        ]);
+    }
+
+    /**
+     * Returns all attendance records for a specific date with worker info.
+     * Used by the General calendar view day-click modal.
+     */
+    public function dayAttendance(Request $request)
+    {
+        $validated = $request->validate([
+            'date' => ['required', 'date_format:Y-m-d'],
+        ]);
+
+        $date = $validated['date'];
+
+        $records = $this->attendanceDB('attendance_records as ar')
+            ->leftJoin('trabajadores as t', 't.id', '=', 'ar.trabajador_id')
+            ->whereDate('ar.captured_at', $date)
+            ->select([
+                'ar.id',
+                'ar.trabajador_id',
+                DB::raw("COALESCE(t.nombre_completo, ar.worker_name) as trabajador_nombre"),
+                'ar.dni',
+                't.cargo',
+                'ar.captured_at',
+                'ar.check_out_at',
+                'ar.worked_minutes',
+                DB::raw("TIME_FORMAT(ar.captured_at, '%H:%i') as hora_entrada"),
+                DB::raw("TIME_FORMAT(ar.check_out_at, '%H:%i') as hora_salida"),
+                DB::raw("COALESCE(ar.worked_minutes, CASE WHEN ar.check_out_at IS NOT NULL THEN TIMESTAMPDIFF(MINUTE, ar.captured_at, ar.check_out_at) ELSE NULL END) as worked_minutes_calc"),
+            ])
+            ->orderBy('ar.captured_at', 'asc')
+            ->get()
+            ->map(function ($row) {
+                $minutes = $row->worked_minutes_calc ?? $row->worked_minutes;
+                $minutes = is_numeric($minutes) ? (int) $minutes : null;
+
+                $capturedAtLima = !empty($row->captured_at)
+                    ? Carbon::parse($row->captured_at)->timezone('America/Lima')
+                    : null;
+
+                $checkOutAtLima = !empty($row->check_out_at)
+                    ? Carbon::parse($row->check_out_at)->timezone('America/Lima')
+                    : null;
+
+                $row->hora_entrada = $capturedAtLima?->format('H:i') ?? $row->hora_entrada;
+                $row->hora_salida = $checkOutAtLima?->format('H:i') ?? $row->hora_salida;
+                $row->worked_minutes = $minutes;
+                $row->worked_time = $this->formatWorkedTime($minutes);
+
+                return $row;
+            });
+
+        return response()->json([
+            'success' => true,
+            'data' => $records,
+            'date' => $date,
+        ]);
+    }
+
     public function counts()
     {
         $personas = DB::table('trabajadores')->where('estado', 'Activo')->count();
 
         $proyectosActivos = DB::table('projects')->where('status', 'active')->count();
-        $preProyectos = DB::table('project_pipeline')
-            ->whereNull('project_id')
-            ->whereNotIn('etapa', ['cerrado_perdido'])
-            ->whereExists(function ($q) {
-                $q->select(DB::raw(1))->from('pipeline_team as pt')
-                    ->join('trabajadores as t', 't.id', '=', 'pt.trabajador_id')
-                    ->whereColumn('pt.pipeline_id', 'project_pipeline.id');
-            })
-            ->count();
 
         return response()->json([
             'personas' => $personas,
-            'proyectos' => $proyectosActivos + $preProyectos,
+            'proyectos' => $proyectosActivos,
         ]);
     }
 
@@ -418,21 +1210,7 @@ class AsistenciaController extends Controller
 
         $projectIds = $activeProjects->pluck('id');
 
-        // ── 2. Pre-proyectos del pipeline (aún no iniciados, con equipo asignado) ──
-        $pipelineProjects = DB::table('project_pipeline as pp')
-            ->whereNull('pp.project_id')
-            ->whereNotIn('pp.etapa', ['cerrado_perdido'])
-            ->whereExists(function ($query) {
-                $query->select(DB::raw(1))
-                    ->from('pipeline_team as pt')
-                    ->join('trabajadores as t', 't.id', '=', 'pt.trabajador_id')
-                    ->whereColumn('pt.pipeline_id', 'pp.id');
-            })
-            ->select(['pp.id as pipeline_id', 'pp.nombre_proyecto as name', 'pp.etapa', 'pp.created_at'])
-            ->orderBy('pp.nombre_proyecto')
-            ->get();
-
-        // ── 3. Trabajadores de proyectos activos ──
+        // ── 2. Trabajadores de proyectos activos (solo asignación directa del proyecto) ──
         $directAssignments = DB::table('project_workers as pw')
             ->join('trabajadores as t', 't.id', '=', 'pw.trabajador_id')
             ->whereIn('pw.project_id', $projectIds)
@@ -448,54 +1226,14 @@ class AsistenciaController extends Controller
             ->get()
             ->groupBy('project_id');
 
-        $pipelineAssignmentsForProjects = DB::table('project_pipeline as pp')
-            ->join('pipeline_team as pt', 'pt.pipeline_id', '=', 'pp.id')
-            ->join('trabajadores as t', 't.id', '=', 'pt.trabajador_id')
-            ->whereIn('pp.project_id', $projectIds)
-            ->select([
-                'pp.project_id',
-                't.id as trabajador_id',
-                't.dni',
-                't.nombre_completo',
-                't.cargo',
-                't.estado',
-            ])
-            ->orderBy('t.nombre_completo')
-            ->get()
-            ->groupBy('project_id');
-
-        // Combinar fuentes para proyectos activos
-        $projectAssignments = $projectIds->mapWithKeys(function ($projectId) use ($directAssignments, $pipelineAssignmentsForProjects) {
+        $projectAssignments = $projectIds->mapWithKeys(function ($projectId) use ($directAssignments) {
             $direct = $directAssignments->get($projectId, collect());
-            $pipeline = $pipelineAssignmentsForProjects->get($projectId, collect());
-            $merged = $direct->concat($pipeline)->unique('trabajador_id')->sortBy('nombre_completo')->values();
-            return [$projectId => $merged];
+            $workers = $direct->unique('trabajador_id')->sortBy('nombre_completo')->values();
+            return [$projectId => $workers];
         });
 
-        // ── 4. Trabajadores de pre-proyectos del pipeline ──
-        $pipelineIds = $pipelineProjects->pluck('pipeline_id');
-        $pipelineTeamAssignments = collect();
-        if ($pipelineIds->isNotEmpty()) {
-            $pipelineTeamAssignments = DB::table('pipeline_team as pt')
-                ->join('trabajadores as t', 't.id', '=', 'pt.trabajador_id')
-                ->whereIn('pt.pipeline_id', $pipelineIds)
-                ->select([
-                    'pt.pipeline_id',
-                    't.id as trabajador_id',
-                    't.dni',
-                    't.nombre_completo',
-                    't.cargo',
-                    't.estado',
-                ])
-                ->orderBy('t.nombre_completo')
-                ->get()
-                ->groupBy('pipeline_id');
-        }
-
-        // ── 5. Asistencias de hoy ──
-        $allWorkerIds = $projectAssignments->flatten()->pluck('trabajador_id')
-            ->merge($pipelineTeamAssignments->flatten()->pluck('trabajador_id'))
-            ->unique()->values();
+        // ── 3. Asistencias de hoy ──
+        $allWorkerIds = $projectAssignments->flatten()->pluck('trabajador_id')->unique()->values();
 
         $todayAttendance = collect();
         if ($allWorkerIds->isNotEmpty()) {
@@ -507,7 +1245,7 @@ class AsistenciaController extends Controller
                 ->keyBy('trabajador_id');
         }
 
-        // ── 6. Construir respuesta ──
+        // ── 4. Construir respuesta ──
         $buildWorkerList = function ($workers) use ($todayAttendance) {
             $presentToday = 0;
             $list = $workers->map(function ($w) use ($todayAttendance, &$presentToday) {
@@ -543,32 +1281,7 @@ class AsistenciaController extends Controller
             ];
         });
 
-        // Pre-proyectos del pipeline
-        $pipelineData = $pipelineProjects->map(function ($pp) use ($pipelineTeamAssignments, $buildWorkerList) {
-            $workers = $pipelineTeamAssignments->get($pp->pipeline_id, collect());
-            [$workerList, $presentToday] = $buildWorkerList($workers);
-            $etapas = [
-                'ingresado' => 'Ingresado',
-                'contactado' => 'Contactado',
-                'visitado' => 'Visitado',
-                'presupuestado' => 'Presupuestado',
-                'negociacion' => 'Negociación',
-                'cerrado_ganado' => 'Cerrado Ganado',
-            ];
-            return [
-                'id' => 'pipeline_' . $pp->pipeline_id,
-                'name' => $pp->name,
-                'abbreviation' => null,
-                'status' => 'pipeline',
-                'etapa' => $etapas[$pp->etapa] ?? ucfirst($pp->etapa),
-                'total_trabajadores' => $workers->count(),
-                'presentes_hoy' => $presentToday,
-                'ausentes_hoy' => $workers->count() - $presentToday,
-                'trabajadores' => $workerList,
-            ];
-        });
-
-        $allData = $data->concat($pipelineData)->values();
+        $allData = $data->values();
 
         return response()->json([
             'success' => true,
@@ -615,5 +1328,40 @@ class AsistenciaController extends Controller
         $time = $payload['hora_entrada'] ?? $fallback?->format('H:i') ?? now()->format('H:i');
 
         return Carbon::createFromFormat('Y-m-d H:i', $date . ' ' . $time);
+    }
+
+    private function resolveCheckOutAt(array $payload, ?Carbon $fallback = null, ?Carbon $entryAt = null): ?Carbon
+    {
+        if (array_key_exists('check_out_at', $payload) && !empty($payload['check_out_at'])) {
+            return Carbon::parse($payload['check_out_at']);
+        }
+
+        if (array_key_exists('hora_salida', $payload)) {
+            $rawTime = trim((string) ($payload['hora_salida'] ?? ''));
+            if ($rawTime === '') {
+                return null;
+            }
+
+            $date = $payload['fecha']
+                ?? $entryAt?->toDateString()
+                ?? $fallback?->toDateString()
+                ?? now()->toDateString();
+
+            return Carbon::createFromFormat('Y-m-d H:i', $date . ' ' . $rawTime);
+        }
+
+        return $fallback;
+    }
+
+    private function formatWorkedTime(?int $minutes): ?string
+    {
+        if ($minutes === null || $minutes < 0) {
+            return null;
+        }
+
+        $hours = intdiv($minutes, 60);
+        $remainingMinutes = $minutes % 60;
+
+        return sprintf('%02d:%02d', $hours, $remainingMinutes);
     }
 }

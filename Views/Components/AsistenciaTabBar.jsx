@@ -2,52 +2,62 @@ import {
   CalendarDaysIcon,
   ClipboardDocumentListIcon,
   ShieldCheckIcon,
-  UsersIcon,
   FolderOpenIcon,
-  CalendarIcon,
+  ClockIcon,
+  BriefcaseIcon,
 } from '@heroicons/react/24/outline';
 
-export default function AsistenciaTabBar({ counts, activeTab, setActiveTab }) {
+export default function AsistenciaTabBar({ counts, activeTab, setActiveTab, auth }) {
+  const hasApprovePermission = auth?.permission_names?.includes('approve_overtime');
+
   const tabs = [
     {
       key: 'hoy',
       label: 'HOY',
       count: counts?.hoy || 0,
       icon: CalendarDaysIcon,
-      activeColor: 'border-emerald-500',
-      textActiveColor: 'text-emerald-600',
+      activeColor: 'border-teal-500',
+      textActiveColor: 'text-teal-600',
     },
     {
       key: 'asistencias',
       label: 'ASISTENCIAS',
       count: counts?.total || 0,
       icon: ClipboardDocumentListIcon,
-      activeColor: 'border-blue-500',
-      textActiveColor: 'text-blue-600',
+      activeColor: 'border-teal-600',
+      textActiveColor: 'text-teal-700',
     },
     {
       key: 'prevencion',
       label: 'PREVENCIÓN',
       count: counts?.prevencion || 0,
       icon: ShieldCheckIcon,
-      activeColor: 'border-amber-500',
-      textActiveColor: 'text-amber-600',
-    },
-    {
-      key: 'personas',
-      label: 'PERSONAS',
-      count: counts?.personas || 0,
-      icon: UsersIcon,
-      activeColor: 'border-purple-500',
-      textActiveColor: 'text-purple-600',
+      activeColor: 'border-teal-500',
+      textActiveColor: 'text-teal-600',
     },
     {
       key: 'proyectos',
       label: 'PROYECTOS',
       count: counts?.proyectos || 0,
       icon: FolderOpenIcon,
-      activeColor: 'border-indigo-500',
-      textActiveColor: 'text-indigo-600',
+      activeColor: 'border-teal-500',
+      textActiveColor: 'text-teal-600',
+    },
+    ...(hasApprovePermission ? [{
+      key: 'horas_extra',
+      label: 'HORAS EXTRA',
+      count: counts?.horas_extra || 0,
+      icon: ClockIcon,
+      activeColor: 'border-amber-500',
+      textActiveColor: 'text-amber-600',
+    }] : []),
+    {
+      key: 'jornada',
+      label: 'JORNADA',
+      count: counts?.jornada || 0,
+      icon: BriefcaseIcon,
+      activeColor: 'border-teal-500',
+      textActiveColor: 'text-teal-600',
     },
   ];
 
@@ -75,7 +85,7 @@ export default function AsistenciaTabBar({ counts, activeTab, setActiveTab }) {
             {tab.label}
             {tab.count > 0 && (
               <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                isActive ? 'bg-gray-100 text-gray-700' : 'bg-gray-100 text-gray-600'
+                isActive ? 'bg-amber-50 text-amber-700' : 'bg-gray-100 text-gray-600'
               }`}>
                 {tab.count}
               </span>

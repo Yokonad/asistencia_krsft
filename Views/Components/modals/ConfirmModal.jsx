@@ -31,7 +31,7 @@ function ConfirmModal({
                 </div>
 
                 <h2 className="text-xl font-bold text-gray-900">{title}</h2>
-                <p className="mt-3 text-[15px] font-medium text-gray-500 leading-relaxed text-balance">{message}</p>
+                <p className="mt-3 text-[15px] font-medium text-gray-500 leading-relaxed text-wrap">{message}</p>
 
                 <footer className="mt-8 flex gap-3">
                     <button 

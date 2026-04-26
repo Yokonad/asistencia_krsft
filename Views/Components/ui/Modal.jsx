@@ -20,15 +20,9 @@ function Modal({ isOpen, onClose, children, size = 'md' }) {
   };
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
-        onClick={onClose}
-      />
-
+    <div className="fixed inset-0 z-50 grid place-content-center bg-black/50 p-4">
       {/* Modal */}
-      <div className={clsx('relative bg-white rounded-lg shadow-lg', sizeClasses[size])}>
+      <div className={clsx('relative w-full rounded-lg bg-white p-6 shadow-lg', sizeClasses[size])}>
         {children}
       </div>
     </div>,

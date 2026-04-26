@@ -119,13 +119,15 @@ export default function AsistenciaModal({ isOpen, onClose, onSubmit, initialData
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      className="fixed inset-0 z-50 grid place-content-center bg-black/50 p-4"
       role="dialog"
       aria-modal="true"
       aria-labelledby="asistenciaModalTitle"
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="w-full max-w-2xl rounded-lg bg-white shadow-lg flex flex-col max-h-[90vh]">
+      <div
+        className="w-full max-w-2xl rounded-lg bg-white p-6 shadow-lg"
+        onClick={(e) => { e.stopPropagation(); }}
+      >
 
         {/* Header */}
         <div className="flex items-center justify-between p-6 pb-2">
@@ -220,7 +222,7 @@ export default function AsistenciaModal({ isOpen, onClose, onSubmit, initialData
             </label>
           </div>
 
-          <div className="grid grid-cols-1 gap-4 mt-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
             <label htmlFor="asistencia-entrada" className="block relative">
               <span className="text-[14px] font-medium text-slate-700">Hora Entrada</span>
               <input
@@ -231,10 +233,22 @@ export default function AsistenciaModal({ isOpen, onClose, onSubmit, initialData
                 className="mt-1.5 w-full rounded-md border border-gray-200 py-2 px-3 text-slate-900 shadow-none sm:text-sm focus:outline-none focus:border-[#00BFA6] focus:ring-1 focus:ring-offset-0 focus:ring-[#00BFA6]"
               />
             </label>
+
+            <label htmlFor="asistencia-salida" className="block relative">
+              <span className="text-[14px] font-medium text-slate-700">Hora Salida</span>
+              <input
+                id="asistencia-salida"
+                type="time"
+                value={data.hora_salida || ''}
+                onChange={(e) => handleChange('hora_salida', e.target.value)}
+                className={`mt-1.5 w-full rounded-md border py-2 px-3 text-slate-900 shadow-none sm:text-sm focus:outline-none focus:border-[#00BFA6] focus:ring-1 focus:ring-offset-0 focus:ring-[#00BFA6] ${errors.hora_salida ? 'border-red-300' : 'border-gray-200'}`}
+              />
+              {errors.hora_salida && <p className="mt-1 text-xs text-red-600">{errors.hora_salida}</p>}
+            </label>
           </div>
 
           <div className="rounded-md border border-emerald-100 bg-emerald-50 px-4 py-3 mt-4">
-            <p className="text-sm font-medium text-emerald-800">El registro manual crea una marcación de ingreso para el trabajador validado.</p>
+            <p className="text-sm font-medium text-emerald-800">Si completas entrada y salida, se calculará automáticamente la duración de la jornada.</p>
           </div>
 
           <div className="relative py-4">

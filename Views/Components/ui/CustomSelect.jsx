@@ -49,7 +49,7 @@ export default function CustomSelect({
       </button>
 
       {isOpen && (
-        <div className="absolute z-50 mt-1 w-full rounded-md bg-white py-1 shadow-lg ring-1 ring-black ring-opacity-5 overflow-hidden">
+        <div className="absolute z-50 mt-1 w-full rounded-md bg-white py-1 shadow-xl border border-gray-100 overflow-hidden">
           <ul className="max-h-60 overflow-auto focus:outline-none text-xs sm:text-sm">
             {options.map((option, idx) => {
               const optValue = typeof option === 'object' ? option.value : option;

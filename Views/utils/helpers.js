@@ -30,6 +30,10 @@ export function validateAsistenciaData(data) {
     errors.fecha = 'La fecha es requerida';
   }
 
+  if (data.hora_entrada && data.hora_salida && data.hora_salida < data.hora_entrada) {
+    errors.hora_salida = 'La hora de salida debe ser mayor o igual a la hora de entrada';
+  }
+
   return {
     isValid: Object.keys(errors).length === 0,
     errors,
@@ -48,5 +52,6 @@ export function createEmptyAsistencia() {
     area: '',
     fecha: new Date().toISOString().split('T')[0],
     hora_entrada: '',
+    hora_salida: '',
   };
 }
